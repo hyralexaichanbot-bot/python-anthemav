@@ -123,10 +123,29 @@
 
 ## Current Status
 
-**Active Phase:** Phase 1 - Ready to start
-**Current Branch:** `master` (2 commits ahead of origin: CI fixes)
-**Last Completed:** N/A
-**Next Action:** Push CI fixes to origin, then create `feature/model-extraction-phase1` branch
+**Active Phase:** Phase 3 - Cleanup and consolidation
+**Current Branch:** `feature/model-extraction-phase3`
+**Last Completed:** Phase 1 & 2
+**Next Action:** Final cleanup, documentation, prepare for merge
+
+## Completed Summary
+
+### Phase 1 ✅
+- Created model classes (base.py, x20.py, x40.py, mdx.py)
+- Created ModelRegistry with detect_model()
+- Updated protocol.py to use model objects
+- Branch: feature/model-extraction-phase1
+
+### Phase 2 ✅
+- Fixed all tests (45 passing)
+- Wired set_zones() to model
+- HA integration tested with MRX 520
+- Branch: feature/model-extraction-phase2
+
+### Phase 3 (In Progress)
+- Final cleanup
+- Documentation updates
+- Prepare merge strategy
 
 ## Notes
 
