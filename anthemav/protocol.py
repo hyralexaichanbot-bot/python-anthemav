@@ -1,10 +1,11 @@
 """Module to maintain AVR state information and network interface."""
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Dict, Optional
 
 from anthemav.device_error import DeviceError
 from anthemav.parser import parse_message
+from anthemav.models import BaseModel, detect_model
 
 __all__ = ["AVR"]
 
@@ -15,44 +16,9 @@ ATTR_CORE = ["IDM"]
 # This is used to force refresh the power state of the device if POW command isn't sent
 ATTR_POWERED_ON = ["Z1ALM", "Z1AIC", "Z1VIR"]
 
-# Audio Listening mode
-ALM_NUMBER_x20 = {
-    "None": 0,
-    "AnthemLogic Cinema": 1,
-    "AnthemLogic Music": 2,
-    "PLII Movie": 3,
-    "PLII Music": 4,
-    "Neo Cinema": 5,
-    "Neo Music": 6,
-    "All Channel": 7,
-    "All Channel Mono": 8,
-    "Mono": 9,
-    "Mono-Academy": 10,
-    "Mono (L)": 11,
-    "Mono (R)": 12,
-    "High Blend": 13,
-    "Dolby Surround": 14,
-}
-
-ALM_NUMBER_x40 = {
-    "None": 0,
-    "AnthemLogic Cinema": 1,
-    "AnthemLogic Music": 2,
-    "Dolby Surround": 3,
-    "DTS neural:X": 4,
-    "DTS Virtual:X": 5,
-    "All Channel Stereo": 6,
-    "Mono": 7,
-    "All Channel Mono": 8,
-}
-
-# Some models (eg:MRX 520) provide a limited list of listening mode
-ALM_RESTRICTED = ["00", "01", "02", "03", "04", "05", "06", "07"]
-
-ALM_RESTRICTED_MODEL = ["MRX 520"]
-
-LOOKUP: dict[str, dict[str, str]] = {}
-ZONELOOKUP: dict[str, dict[str, str]] = {}
+# Global lookup tables - populated from model when detected
+LOOKUP: Dict[str, Dict[str, str]] = {}
+ZONELOOKUP: Dict[str, Dict[str, str]] = {}
 
 ZONELOOKUP["POW"] = {"description": "Zone Power", "0": "Off", "1": "On"}
 ZONELOOKUP["VOL"] = {"description": "Zone Volume"}
@@ -141,9 +107,7 @@ LOOKUP["Z1DYN"] = {
     "2": "Late Night",
 }
 LOOKUP["Z1DIA"] = {"description": "Dolby digital dialog normalization (dB)"}
-
-# Model specific lookupp
-# MRX 520, 720, 1120
+# Model-specific lookups will be populated from model object when detected
 LOOKUP["IDN"] = {"description": "MAC address"}
 LOOKUP["ECH"] = {"description": "Tx status", "0": "Off", "1": "On"}
 LOOKUP["SIP"] = {"description": "Standby IP control", "0": "Off", "1": "On"}
@@ -155,8 +119,6 @@ LOOKUP["FPB"] = {
     "2": "Medium",
     "3": "High",
 }
-
-# MRX 540, 740, 1140
 LOOKUP["WMAC"] = {"description": "Wi-Fi MAC address"}
 LOOKUP["EMAC"] = {"description": "Ethernet MAC address"}
 LOOKUP["GCFPB"] = {"description": "Front Panel Brightness"}
@@ -166,34 +128,10 @@ LOOKUP["GCTXS"] = {
     "1": "IP On",
     "2": "IP and RS232 on",
 }
-
-# MDX
 LOOKUP["MAC"] = {"description": "MAC address"}
-
-COMMANDS_X20 = ["IDN", "ECH", "SIP", "Z1ARC", "FPB"]
-COMMANDS_X40 = ["PVOL", "WMAC", "EMAC", "IS1ARC", "GCFPB", "GCTXS"]
-COMMANDS_MDX_IGNORE = [
-    "IDR",
-    "ICN",
-    "Z1AIC",
-    "Z1AIN",
-    "Z1AIR",
-    "Z1ALM",
-    "Z1BRT",
-    "Z1DIA",
-    "Z1DYN",
-    "Z1IRH",
-    "Z1IRV",
-    "Z1VIR",
-]
-COMMANDS_MDX = ["MAC"]
 
 EMPTY_MAC = "00:00:00:00:00:00"
 UNKNOWN_MODEL = "Unknown Model"
-
-MODEL_X40 = "x40"
-MODEL_X20 = "x20"
-MODEL_MDX = "mdx"
 
 
 # pylint: disable=too-many-instance-attributes, too-many-public-methods
@@ -202,103 +140,88 @@ class AVR(asyncio.Protocol):
 
     def __init__(
         self,
-        update_callback: Callable[[str], None] | None = None,
-        connection_lost_callback: Callable[[], Awaitable[None]] | None = None,
-        buffer_max_size: int = 8192,
-    ) -> None:
-        """Initialize the AVR protocol handler.
+        update_callback: Callable[[str], None] = None,
+        loop: asyncio.AbstractEventLoop = None,
+        connection_lost_callback: Callable[[], Awaitable[None]] = None,
+    ):
+        """Protocol handler that handles all status and changes on AVR.
 
-        :param update_callback: Called when device state changes
-        :param connection_lost_callback: Called when connection is lost
-        :param buffer_max_size: Maximum buffer size in bytes
+        This class is expected to be wrapped inside a Connection class object
+        which will maintain the socket and handle auto-reconnects.
+
+            :param update_callback:
+                called if any state information changes in device (optional)
+            :param connection_lost_callback:
+                called when connection is lost to device (optional)
+            :param loop:
+                asyncio event loop (optional)
+
+            :type update_callback:
+                callable
+            :type: connection_lost_callback:
+                callable
+            :type loop:
+                asyncio.loop
         """
+        self._loop = loop
         self.log = logging.getLogger(__name__)
         self._connection_lost_callback = connection_lost_callback
         self._update_callback = update_callback
         self.buffer = ""
-        self._buffer_max_size = buffer_max_size
         self._input_names = {}
         self._input_numbers = {}
         self._device_power = False
         self._poweron_refresh_successful = False
-        self.transport = None
+        self.transport: asyncio.Transport = None
         self._ignored_commands = []
         self._force_refresh = False
-        self._model_series = ""
+        self._model: Optional[BaseModel] = None
         self._last_command = ""
         self._deviceinfo_received = asyncio.Event()
-        self._alm_number = {"None": 0}
+        self._alm_number: Dict[str, int] = {"None": 0}
         self._available_input_numbers = []
-        self.zones = {1: Zone(self, 1)}
-        self.values = {}
+        self.zones: Dict[int, Zone] = {1: Zone(self, 1)}
+        self.values: Dict[str, str] = {}
 
         for key in LOOKUP:
             setattr(self, f"_{key}", "")
 
-    def _call_soon(self, callback: Callable, *args) -> None:
-        """Schedule a callback to be called soon on the event loop."""
-        loop = asyncio.get_running_loop()
-        loop.call_soon(callback, *args)
-
-    def _call_later(self, delay: float, callback: Callable, *args) -> None:
-        """Schedule a callback to be called after a delay."""
-        loop = asyncio.get_running_loop()
-        loop.call_later(delay, callback, *args)
-
-    async def wait_for_device_initialised(self, timeout: float) -> None:
-        """Wait for device initialization (model and MAC address).
-
-        :raises DeviceError: If initialization times out or is incomplete
-        """
+    async def wait_for_device_initialised(self, timeout: float):
+        """Wait to receive the model and mac address for the device."""
         try:
             await asyncio.wait_for(self._deviceinfo_received.wait(), timeout)
         except asyncio.TimeoutError:
-            error_msg = (
-                f"Device initialization timed out after {timeout} seconds. "
-                f"Model: {self.model}, MAC: {self.macaddress}"
-            )
-            self.log.error(error_msg)
-            raise DeviceError(message=error_msg, context={"timeout": timeout, "model": self.model, "macaddress": self.macaddress})
+            raise DeviceError
 
         if self.macaddress == EMPTY_MAC or self.model == UNKNOWN_MODEL:
-            error_msg = f"Device initialization incomplete. Model: {self.model}, MAC: {self.macaddress}"
-            self.log.error(error_msg)
-            raise DeviceError(message=error_msg, context={"model": self.model, "macaddress": self.macaddress})
+            raise DeviceError
 
-        self.log.debug("Device initialized")
+        self.log.debug("device is initialised")
 
-    def is_initialized(self) -> bool:
-        """Check if device is initialized without blocking.
+    def _set_device_initialised(self):
+        """Indicate if the model and mac address have been received."""
+        if self._model is not None and self.macaddress != EMPTY_MAC:
+            self._deviceinfo_received.set()
 
-        Returns:
-            bool: True if device initialization event is set, False otherwise
+    async def refresh_core(self):
+        """Query device for all attributes that exist regardless of power state.
+
+        This will force a refresh for all device queries that are valid to
+        request at any time.  It's the only safe suite of queries that we can
+        make if we do not know the current state (on or off+standby).
+
+        This does not return any data, it just issues the queries.
         """
-        return self._deviceinfo_received.is_set()
-
-    def _set_device_initialised(self) -> None:
-        """Set initialization event if model and MAC are valid."""
-        if self.model == UNKNOWN_MODEL:
-            self.log.debug("Device initialization incomplete: model is UNKNOWN_MODEL")
-            return
-
-        if self.macaddress == EMPTY_MAC:
-            self.log.debug("Device initialization incomplete: MAC is EMPTY_MAC")
-            return
-
-        self.log.debug("Device initialized: model=%s, MAC=%s", self.model, self.macaddress)
-        self._deviceinfo_received.set()
-
-    async def refresh_core(self) -> None:
-        """Query device for all attributes that exist regardless of power state."""
-        self.log.debug("Sending core query for all attributes")
+        self.log.debug("Sending out core query for all attributes")
         for key in ATTR_CORE:
             if self.transport is None:
                 self.log.warning("Lost connection to receiver while refreshing device")
                 break
             self.query(key)
+            # small delay between command
             await asyncio.sleep(0.01)
 
-    async def poweron_refresh(self) -> None:
+    async def poweron_refresh(self):
         """Keep requesting all attributes until it works.
 
         Immediately after a power on event (POW1) the AVR is inconsistent with
@@ -315,26 +238,35 @@ class AVR(asyncio.Protocol):
             await asyncio.sleep(5)
             await self.poweron_refresh()
 
-    async def refresh_all(self) -> None:
-        """Query device for all known attributes."""
+    async def refresh_all(self):
+        """Query device for all attributes that are known.
+
+        This will force a refresh for all device queries that the module is
+        aware of.  In theory, this will completely populate the internal state
+        table for all attributes.
+
+        This does not return any data, it just issues the queries.
+        """
         self.log.debug("refresh_all")
+        # refresh main attribues
         await self.query_commands(LOOKUP)
-        if self._model_series == MODEL_MDX:
+        if self._model is not None and self._model.model_series == "mdx":
+            # MDX receivers don't returns the list of available input numbers and have a fixed list
             self._populate_inputs(12)
 
-    async def refresh_power(self) -> None:
+    async def refresh_power(self):
         """Refresh power of all zones."""
         self.log.debug("refresh_power")
         for zone in self.zones:
             self.query(f"Z{zone}POW")
             await asyncio.sleep(0.02)
 
-    async def refresh_zone(self, zone: int) -> None:
+    async def refresh_zone(self, zone: int):
         """Query all zones for all attributes."""
         self.log.debug(f"refresh_zone: {zone}")
         await self.query_commands(ZONELOOKUP, zone)
 
-    async def query_commands(self, commands: dict[str, dict[str, str]], zone: int = 0) -> None:
+    async def query_commands(self, commands: Dict[str, Dict[str, str]], zone: int = 0):
         """Query a list of commands."""
         for key in commands:
             if key not in self._ignored_commands:
@@ -354,91 +286,89 @@ class AVR(asyncio.Protocol):
     # asyncio network functions
     #
 
-    def connection_made(self, transport: asyncio.Transport) -> None:
-        """Called when network connection is established."""
+    def connection_made(self, transport: asyncio.Transport):
+        """Called when asyncio.Protocol establishes the network connection."""
         self.log.debug("Connection established to AVR")
         self.transport = transport
 
+        # self.transport.set_write_buffer_limits(0)
         limit_low, limit_high = self.transport.get_write_buffer_limits()
         self.log.debug("Write buffer limits %d to %d", limit_low, limit_high)
         self._poweron_refresh_successful = False
         self._device_power = False
         for zone in self.zones.values():
             zone.need_refresh = True
-        asyncio.create_task(self.refresh_core())
+        asyncio.run_coroutine_threadsafe(self.refresh_core(), self._loop)
 
-    def _append_to_buffer(self, data: bytes) -> None:
-        """Append data to buffer with overflow protection."""
-        self.buffer += data.decode('utf-8', errors='replace')
-        if len(self.buffer) > self._buffer_max_size:
-            self.log.warning(
-                "Buffer overflow: %d bytes (max %d), truncating",
-                len(self.buffer),
-                self._buffer_max_size
-            )
-            self.buffer = self.buffer[-self._buffer_max_size // 2:]
-
-    def data_received(self, data: bytes) -> None:
-        """Handle received data from the device."""
+    def data_received(self, data):
+        """Called when asyncio.Protocol detects received data from network."""
+        self.buffer += data.decode()
+        self.log.debug("Received %d bytes from AVR: %s", len(self.buffer), self.buffer)
         try:
-            self.log.debug("Received %d bytes from AVR: %s", len(self.buffer), self.buffer)
-            self._append_to_buffer(data)
-            asyncio.create_task(self._assemble_buffer())
+            self._loop.create_task(self._assemble_buffer())
         except Exception as error:
-            self.log.error(
-                "Error in data_received (buffer size: %d): %s",
-                len(self.buffer),
-                error,
-                exc_info=True
-            )
+            self.log.warning("Unable to parse message. Error: %s", error)
 
-    def connection_lost(self, exc: Exception | None) -> None:
-        """Called when network connection is lost."""
+    def connection_lost(self, exc):
+        """Called when asyncio.Protocol loses the network connection."""
         self.log.warning("Lost connection to receiver")
-        if exc:
+
+        if exc is not None:
             self.log.debug(exc)
+
         self.transport = None
+
         if self._connection_lost_callback:
-            asyncio.create_task(self._connection_lost_callback())
-
-    async def _assemble_buffer(self) -> None:
-        """Split received data into individual commands."""
-        try:
-            self.transport.pause_reading()
-            messages = self.buffer.split(";")
-
-            for message in messages[:-1]:
-                if message:
-                    self.log.debug("assembled message %s", message)
-                    await self._parse_message(message)
-                elif self._last_command:
-                    last_command = self._last_command
-                    self._last_command = ""
-                    self.log.debug("send last command %s", last_command)
-                    await self._parse_message(last_command)
-
-            self.buffer = messages[-1]
-            self.transport.resume_reading()
-        except Exception as error:
-            self.log.error(
-                "Error assembling buffer (buffer size: %d): %s",
-                len(self.buffer),
-                error,
-                exc_info=True
+            asyncio.run_coroutine_threadsafe(
+                self._connection_lost_callback(), self._loop
             )
-            if self.transport:
-                self.transport.resume_reading()
 
-    def _populate_inputs(self, total: int) -> None:
-        """Request names for all active inputs."""
-        for input_number in range(1, total + 1):
-            if self._model_series == MODEL_X40:
+    async def _assemble_buffer(self):
+        """Split up received data from device into individual commands.
+
+        Data sent by the device is a sequence of datagrams separated by
+        semicolons.  It's common to receive a burst of them all in one
+        submission when there's a lot of device activity.  This function
+        disassembles the chain of datagrams into individual messages which
+        are then passed on for interpretation.
+        """
+        self.transport.pause_reading()
+
+        for message in self.buffer.split(";"):
+            if message != "":
+                self.log.debug("assembled message %s", message)
+                await self._parse_message(message)
+            elif self._last_command != "":
+                # For some case the receiver only send ; to confirm receiving previous command.
+                last_command = self._last_command
+                self._last_command = ""
+                self.log.debug("send last command %s", last_command)
+                await self._parse_message(last_command)
+
+        self.buffer = ""
+
+        self.transport.resume_reading()
+        return
+
+    def _populate_inputs(self, total):
+        """Request the names for all active, configured inputs on the device.
+
+        Once we learn how many inputs are configured, this function is called
+        which will ask for the name of each active input.
+        """
+        total = total + 1
+        for input_number in range(1, total):
+            if self._model is not None and self._model.model_series == "x40":
                 self.query(f"IS{input_number}IN")
                 self.query(f"IS{input_number}ARC")
-            elif not self._available_input_numbers or input_number in self._available_input_numbers:
-                self.query(f"ISN{input_number:02d}")
+            else:
+                if (
+                    len(self._available_input_numbers) == 0
+                    or input_number in self._available_input_numbers
+                ):
+                    self.query(f"ISN{input_number:02d}")
 
-    async def _parse_message(self, data: str) -> None:
+    async def _parse_message(self, data: str):
         """Interpret each message datagram from device and do the needful.
 
         This function receives datagrams from _assemble_buffer and inerprets
@@ -562,26 +492,24 @@ class AVR(asyncio.Protocol):
                     )
                     newdata = True
             else:
-                try:
-                    parsed_message = parse_message(data)
-                    if parsed_message is not None:
-                        recognized = True
-                        oldvalue = self.values.get(parsed_message.command)
-                        if parsed_message.value != oldvalue:
-                            newdata = True
-                            self.values[parsed_message.command] = parsed_message.value
-                            self.log.debug(
-                                "New value - command:%s value:%s input_number:%s",
-                                parsed_message.command,
-                                parsed_message.value,
-                                parsed_message.input_number,
-                            )
-                except ValueError as e:
-                    self.log.warning("Parse error: %s", e)
+                # use parser for other commands
+                parsed_message = parse_message(data)
+                if parsed_message is not None:
+                    recognized = True
+                    oldvalue = self.values.get(parsed_message.command)
+                    if parsed_message.value != oldvalue:
+                        newdata = True
+                        self.values[parsed_message.command] = parsed_message.value
+                        self.log.debug(
+                            "New value - command:%s value:%s input_number:%s",
+                            parsed_message.command,
+                            parsed_message.value,
+                            parsed_message.input_number,
+                        )
 
         if newdata:
             if self._update_callback:
-                self._call_soon(self._update_callback, data)
+                self._loop.call_soon(self._update_callback, data)
         else:
             self.log.debug("no new data encountered")
 
@@ -615,32 +543,44 @@ class AVR(asyncio.Protocol):
                             # all zone are off, switch off device
                             self.power_off_device()
                 if newdata and zoneCommand == "INP":
-                    self._call_later(2, lambda: asyncio.create_task(self.refresh_input()))
+                    self._loop.call_later(
+                        2,
+                        asyncio.run_coroutine_threadsafe,
+                        self.refresh_input(),
+                        self._loop,
+                    )
                 break
 
         return newdata
 
-    def power_off_device(self) -> None:
+    def power_off_device(self):
         """Set device as powered off."""
         self.log.debug("Power off device")
         self._poweron_refresh_successful = False
         self._device_power = False
 
-    def power_on_device(self) -> None:
+    def power_on_device(self):
         """Set device as powered on."""
         self.log.debug("Powered on device detected refresh all attributes")
         self._device_power = True
         self._poweron_refresh_successful = False
-        self._call_later(1, lambda: asyncio.create_task(self.poweron_refresh()))
+        self._loop.call_later(
+            1,
+            asyncio.run_coroutine_threadsafe,
+            self.poweron_refresh(),
+            self._loop,
+        )
 
-    async def refresh_input(self) -> None:
+    async def refresh_input(self):
         """Refresh specific input commands."""
-        if self._model_series == MODEL_X20:
+        if self._model is None:
+            return
+        if self._model.model_series == "x20":
             self.query("Z1ARC")
-        elif self._model_series == MODEL_X40:
+        elif self._model.model_series == "x40":
             self.query(f"IS{self.zones[1].input_number}ARC")
 
-    async def force_refresh_power(self, command: str) -> None:
+    async def force_refresh_power(self, command):
         """Force refresh of poweron when receiving commands."""
         if (
             self._force_refresh is False
@@ -652,9 +592,9 @@ class AVR(asyncio.Protocol):
             self._force_refresh = True
             self.log.debug("Force refresh Power State")
             await self.refresh_power()
-            self._call_later(2, setattr, self, "_force_refresh", False)
+            self._loop.call_later(2, setattr, self, "_force_refresh", False)
 
-    def query(self, item: str) -> None:
+    def query(self, item: str):
         """Issue a raw query to the device for an item.
 
         This function is used to request that the device supply the current
@@ -677,47 +617,74 @@ class AVR(asyncio.Protocol):
         item = item + "?"
         self.command(item)
 
-    def set_model_command(self, model: str) -> None:
+    def set_model_command(self, model: str):
         """Add the commands to the model."""
-        if "40" in model or "70" in model or "90" in model:
+        # Detect model using registry
+        self._model = detect_model(model)
+        
+        if self._model is None:
+            self.log.warning("Unknown model: %s, defaulting to x20", model)
+            self._model = detect_model("MRX 520")  # Default to x20
+        
+        self.log.debug("Detected model series: %s", self._model.model_series)
+        
+        # Set ignored commands based on model
+        if self._model.model_series == "x40":
             self.log.debug("Set Command to Model x40")
-            self._ignored_commands = COMMANDS_X20 + COMMANDS_MDX
-            self._model_series = MODEL_X40
-            self.query("GCTXS")
-            self.query("EMAC")
-            self.query("WMAC")
-            self._alm_number = ALM_NUMBER_x40
-        elif "MDX" in model or "MDA" in model:
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add MDX commands to ignore
+            mdx_model = detect_model("MDX-8")
+            if mdx_model:
+                self._ignored_commands.extend(mdx_model.commands_to_ignore)
+            # Query x40-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
+        elif self._model.model_series == "mdx":
             self.log.debug("Set Command to Model MDX")
-            self._ignored_commands = COMMANDS_X20 + COMMANDS_X40 + COMMANDS_MDX_IGNORE
-            self._model_series = MODEL_MDX
-            self.query("MAC")
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add x20 and x40 commands to ignore
+            x20_model = detect_model("MRX 520")
+            x40_model = detect_model("MRX 540")
+            if x20_model:
+                self._ignored_commands.extend(x20_model.commands_to_ignore)
+            if x40_model:
+                self._ignored_commands.extend(x40_model.commands_to_ignore)
+            # Query MDX-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
         else:
             self.log.debug("Set Command to Model x20")
-            self._ignored_commands = COMMANDS_X40 + COMMANDS_MDX
-            self._model_series = MODEL_X20
-            self._alm_number = ALM_NUMBER_x20
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add MDX commands to ignore
+            mdx_model = detect_model("MDX-8")
+            if mdx_model:
+                self._ignored_commands.extend(mdx_model.commands_to_ignore)
+            # Query x20-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
+            # x20-specific initialization
             self.command("ECH1")
-            self.query("IDN")
 
-    def set_zones(self, model: str) -> None:
+    def set_zones(self, model: str):
         """Set zones for the appropriate objects."""
-        number_of_zones: int = 0
-        if self._model_series == MODEL_MDX and "16" in model:
-            number_of_zones = 8
-        elif self._model_series == MODEL_MDX and "8" in model:
-            number_of_zones = 4
-            # MDX 16 input number range is 1 to 12, but MDX 8 only have 1 to 4 and 9
-            self._available_input_numbers = [1, 2, 3, 4, 9]
-        else:
+        if self._model is None:
+            self.log.warning("Model not set, defaulting to 2 zones")
             number_of_zones = 2
+        else:
+            number_of_zones = self._model.get_zone_count(model)
+            # Get available input numbers for MDX-8
+            if self._model.model_series == "mdx" and "8" in model:
+                self._available_input_numbers = self._model.get_available_input_numbers(model)
 
         self.log.debug(f"Initialize {number_of_zones} zones")
         for zone in range(1, number_of_zones + 1):
             if zone not in self.zones:
                 self.zones[zone] = Zone(self, zone)
 
-    def command(self, command: str) -> None:
+    def command(self, command: str):
         """Issue a raw command to the device.
 
         This function is used to update a data item on the device.  It's used
@@ -739,7 +706,7 @@ class AVR(asyncio.Protocol):
         command = command + ";"
         self.formatted_command(command)
 
-    def formatted_command(self, command: str) -> None:
+    def formatted_command(self, command: str):
         """Issue a raw, formatted command to the device.
 
         This function is invoked by both query and command and is the point
@@ -758,42 +725,30 @@ class AVR(asyncio.Protocol):
         command = command.encode()
 
         self.log.debug("> %s", command)
-
-        if self.transport is None:
-            self.log.error(
-                "No transport available, unable to send command: %s",
-                command.decode()
-            )
-            return
-
         try:
             self.transport.write(command)
         except Exception as error:
-            error_msg = f"Failed to send command '{command.decode()}': {error}"
-            self.log.error(
-                "Error sending command: %s",
-                error,
-                exc_info=True
+            self.log.warning(
+                "No transport found, unable to send command. error: %s", str(error)
             )
-            raise RuntimeError(error_msg) from error
 
     @property
     def support_audio_listening_mode(self) -> bool:
         """Return true if the zone support audio listening mode."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
     def support_profile(self) -> bool:
         """Return true if the zone support sound mode and sound mode list."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
     def support_arc(self) -> bool:
         """Return true if the zone support Anthem room correction."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
-    def attenuation(self) -> int:
+    def attenuation(self):
         """Current volume attenuation in dB (read/write).
 
         You can get or set the current attenuation value on the device with this
@@ -807,11 +762,11 @@ class AVR(asyncio.Protocol):
         self.zones[1].attenuation
 
     @attenuation.setter
-    def attenuation(self, value: int) -> None:
+    def attenuation(self, value):
         self.zones[1].attenuation = value
 
     @property
-    def volume(self) -> int:
+    def volume(self):
         """Current volume level (read/write).
 
         You can get or set the current volume value on the device with this
@@ -825,11 +780,11 @@ class AVR(asyncio.Protocol):
         return self.zones[1].volume
 
     @volume.setter
-    def volume(self, value: int) -> None:
+    def volume(self, value):
         self.zones[1].volume = value
 
     @property
-    def volume_as_percentage(self) -> float:
+    def volume_as_percentage(self):
         """Current volume as percentage (read/write).
 
         You can get or set the current volume value as a percentage.  Valid
@@ -843,7 +798,7 @@ class AVR(asyncio.Protocol):
         return self.zones[1].volume_as_percentage
 
     @volume_as_percentage.setter
-    def volume_as_percentage(self, value: float) -> None:
+    def volume_as_percentage(self, value):
         self.zones[1].volume_as_percentage = value
 
     #
@@ -851,7 +806,7 @@ class AVR(asyncio.Protocol):
     # properties that are read/write
     #
 
-    def _get_boolean(self, key: str) -> bool:
+    def _get_boolean(self, key):
         keyname = "_" + key
         try:
             value = getattr(self, keyname)
@@ -861,14 +816,14 @@ class AVR(asyncio.Protocol):
         except AttributeError:
             return False
 
-    def _convert_to_boolean(self, value: str) -> bool | None:
+    def _convert_to_boolean(self, value: str) -> bool:
         if value == "1":
             return True
         elif value == "0":
             return False
         return None
 
-    def _set_boolean(self, key: str, value: bool) -> None:
+    def _set_boolean(self, key, value):
         if value is True:
             self.command(key + "1")
         else:
@@ -879,7 +834,7 @@ class AVR(asyncio.Protocol):
     #
 
     @property
-    def power(self) -> bool:
+    def power(self):
         """Report if device powered on or off (read/write).
 
         Returns and expects a boolean value.
@@ -887,11 +842,11 @@ class AVR(asyncio.Protocol):
         return self.zones[1].power
 
     @power.setter
-    def power(self, value: bool) -> None:
+    def power(self, value):
         self.zones[1].power = value
 
     @property
-    def txstatus(self) -> bool:
+    def txstatus(self):
         """Current TX Status of the device (read/write).
 
         When enabled, all commands, status changes, and control information
@@ -908,11 +863,11 @@ class AVR(asyncio.Protocol):
         return self._get_boolean("ECH")
 
     @txstatus.setter
-    def txstatus(self, value: bool) -> None:
+    def txstatus(self, value):
         self._set_boolean("ECH", value)
 
     @property
-    def standby_control(self) -> bool:
+    def standby_control(self):
         """Current Standby IP Control of the device (read/write).
 
         When disabled, the AVM/MRX goes into a low-consumption standby mode and
@@ -926,25 +881,29 @@ class AVR(asyncio.Protocol):
         return self._get_boolean("SIP")
 
     @standby_control.setter
-    def standby_control(self, value: bool) -> None:
+    def standby_control(self, value):
         self._set_boolean("SIP", value)
 
     @property
     def arc(self) -> bool:
         """Current ARC (Anthem Room Correction) on or off (read/write)."""
-        if self._model_series == MODEL_X40:
+        if self._model is None:
+            return None
+        if self._model.model_series == "x40":
             return self._convert_to_boolean(
                 self.zones[1].get_current_input_value("ARC")
             )
-        elif self._model_series == MODEL_X20:
+        elif self._model.model_series == "x20":
             return self._get_boolean("Z1ARC")
         return None
 
     @arc.setter
-    def arc(self, value: bool) -> None:
-        if self._model_series == MODEL_X40:
+    def arc(self, value):
+        if self._model is None:
+            return
+        if self._model.model_series == "x40":
             self._set_boolean(f"IS{self.zones[1].input_number}ARC", value)
-        elif self._model_series == MODEL_X20:
+        elif self._model.model_series == "x20":
             self._set_boolean("Z1ARC", value)
 
     #
@@ -952,42 +911,42 @@ class AVR(asyncio.Protocol):
     #
 
     @property
-    def model(self) -> str:
+    def model(self):
         """Device Model Name (read-only)."""
         return self._IDM or UNKNOWN_MODEL
 
     @property
-    def swversion(self) -> str:
+    def swversion(self):
         """Software version (read-only)."""
         return self._IDS or "Unknown Version"
 
     @property
-    def region(self) -> str:
+    def region(self):
         """Region (read-only)."""
         return self._IDR or "Unknown Region"
 
     @property
-    def build_date(self) -> str:
+    def build_date(self):
         """Software build date (read-only)."""
         return self._IDB or "Unknown Build Date"
 
     @property
-    def hwversion(self) -> str:
+    def hwversion(self):
         """Hardware version (read-only)."""
         return self._IDH or "Unknown Version"
 
     @property
-    def macaddress(self) -> str:
+    def macaddress(self):
         """Network MCU MAC address (read-only)."""
         return self._IDN or self._EMAC or self._WMAC or self._MAC or EMPTY_MAC
 
     @property
-    def audio_input_name(self) -> str:
+    def audio_input_name(self):
         """Current audio input format short description (read-only)."""
         return self._Z1AIN or ""
 
     @property
-    def audio_input_ratename(self) -> str:
+    def audio_input_ratename(self):
         """Current audio input format sample or bit rate (read-only)."""
         return self._Z1AIR or ""
 
@@ -995,7 +954,7 @@ class AVR(asyncio.Protocol):
     # Read-only raw numeric properties
     #
 
-    def _get_integer(self, key: str) -> int | None:
+    def _get_integer(self, key):
         keyname = "_" + key
         if hasattr(self, keyname):
             value = getattr(self, keyname)
@@ -1005,7 +964,7 @@ class AVR(asyncio.Protocol):
             return
 
     @property
-    def dolby_dialog_normalization(self) -> int | None:
+    def dolby_dialog_normalization(self):
         """Query Dolby Digital dialog normalization amount (read-only).
 
         Returns value in dB of normalization (if applicable).
@@ -1013,17 +972,17 @@ class AVR(asyncio.Protocol):
         return self._get_integer("Z1DIA")
 
     @property
-    def horizontal_resolution(self) -> int | None:
+    def horizontal_resolution(self):
         """Query active horizontal video resolution (in pixels)."""
         return self._get_integer("Z1IRH")
 
     @property
-    def vertical_resolution(self) -> int | None:
+    def vertical_resolution(self):
         """Query active vertical video resolution (in pixels)."""
         return self._get_integer("Z1IRV")
 
     @property
-    def audio_input_bitrate(self) -> int | None:
+    def audio_input_bitrate(self):
         """Query audio input bitrate (in kbps).
 
         For Analog/PCM inputs this is equal to the sample rate multiplied by
@@ -1032,7 +991,7 @@ class AVR(asyncio.Protocol):
         return self._get_integer("Z1BRT")
 
     @property
-    def audio_input_samplerate(self) -> int | None:
+    def audio_input_samplerate(self):
         """Query audio input sampling rate (kHz)."""
         return self._get_integer("Z1SRT")
 
@@ -1040,7 +999,7 @@ class AVR(asyncio.Protocol):
     # Helper functions for working with raw/text multi-property items
     #
     #
-    def _get_multiprop(self, key: str, mode: str = "raw") -> str | None:
+    def _get_multiprop(self, key, mode="raw"):
         keyname = "_" + key
 
         if hasattr(self, keyname):
@@ -1063,7 +1022,7 @@ class AVR(asyncio.Protocol):
     #
     #
     @property
-    def panel_brightness(self) -> str | None:
+    def panel_brightness(self):
         """Current front panel brightness value (int 0-3) (read-write).
 
         0=off, 1=low, 2=medium, 3=high
@@ -1071,26 +1030,26 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("FPB", mode="raw")
 
     @property
-    def panel_brightness_text(self) -> str | None:
+    def panel_brightness_text(self):
         """Current front panel brighness value (str) (read-only)."""
         return self._get_multiprop("FPB", mode="text")
 
     @panel_brightness.setter
-    def panel_brightness(self, number: int) -> None:
+    def panel_brightness(self, number):
         if isinstance(number, int):
             if 0 <= number <= 3:
                 self.log.debug("Switching panel brightness to %s", str(number))
                 self.command("FPB" + str(number))
 
     @property
-    def audio_listening_mode_list(self) -> list[str]:
+    def audio_listening_mode_list(self):
         """List of available listening mode."""
         if any(m in self.model for m in ALM_RESTRICTED_MODEL):
             return [LOOKUP["Z1ALM"][s] for s in ALM_RESTRICTED]
         return list(self._alm_number.keys())
 
     @property
-    def audio_listening_mode(self) -> str | None:
+    def audio_listening_mode(self):
         """Current audio listening mode (00-16) (read-write).
 
         Audio Listening Mode: 00=None, 01=AnthemLogic-Movie,
@@ -1105,25 +1064,25 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("Z1ALM", mode="raw")
 
     @property
-    def audio_listening_mode_text(self) -> str | None:
+    def audio_listening_mode_text(self):
         """Current audio listening mode (str) (read-only)."""
         return self._get_multiprop("Z1ALM", mode="text")
 
     @audio_listening_mode.setter
-    def audio_listening_mode(self, number: int) -> None:
+    def audio_listening_mode(self, number):
         if isinstance(number, int):
             if 0 <= number <= 16:
                 self.log.debug("Switching audio listening mode to %s", number)
                 self.command("Z1ALM" + str(number).zfill(2))
 
     @audio_listening_mode_text.setter
-    def audio_listening_mode_text(self, text: str) -> None:
+    def audio_listening_mode_text(self, text):
         self.log.debug("Switching audio listening mode to %s", text)
         if text in self._alm_number:
             self.command(f"Z1ALM{self._alm_number[text]:02d}")
 
     @property
-    def dolby_dynamic_range(self) -> str | None:
+    def dolby_dynamic_range(self):
         """Current Dolby Dynamic Range setting (0-2) (read-write).
 
         Applies to Dolby Digital 5.1 source only.
@@ -1133,12 +1092,12 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("Z1DYN", mode="raw")
 
     @property
-    def dolby_dynamic_range_text(self) -> str | None:
+    def dolby_dynamic_range_text(self):
         """Current Dolby Dynamic Range setting (str) (read-only)."""
         return self._get_multiprop("Z1DYN", mode="text")
 
     @dolby_dynamic_range.setter
-    def dolby_dynamic_range(self, number: int) -> None:
+    def dolby_dynamic_range(self, number):
         if isinstance(number, int):
             if 0 <= number <= 2:
                 self.log.debug("Switching Dolby dynamic range to %s", str(number))
@@ -1149,7 +1108,7 @@ class AVR(asyncio.Protocol):
     #
 
     @property
-    def video_input_resolution(self) -> str | None:
+    def video_input_resolution(self):
         """Current video input resolution (0-14) (read-only).
 
         0=no input, 1=other, 2=1080p60, 3=1080p50, 4=1080p24, 5=1080i60,
@@ -1159,12 +1118,12 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("Z1VIR", mode="raw")
 
     @property
-    def video_input_resolution_text(self) -> str | None:
+    def video_input_resolution_text(self):
         """Current video input resolution (str) (read-only)."""
         return self._get_multiprop("Z1VIR", mode="text")
 
     @property
-    def audio_input_channels(self) -> str | None:
+    def audio_input_channels(self):
         """Current audio input channels (0-7) (read-only).
 
         0=no input, 1=other, 2=mono (center channel only), 3=2-channel,
@@ -1173,12 +1132,12 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("Z1AIC", mode="raw")
 
     @property
-    def audio_input_channels_text(self) -> str | None:
+    def audio_input_channels_text(self):
         """Current audio input channels (str) (read-only)."""
         return self._get_multiprop("Z1AIC", mode="text")
 
     @property
-    def audio_input_format(self) -> str | None:
+    def audio_input_format(self):
         """Current audio input format (0-6) (read-only).
 
         0=no input, 1=Analog, 2=PCM, 3=Dolby, 4= DSD, 5=DTS, 6=Atmos.
@@ -1186,7 +1145,7 @@ class AVR(asyncio.Protocol):
         return self._get_multiprop("Z1AIF", mode="raw")
 
     @property
-    def audio_input_format_text(self) -> str | None:
+    def audio_input_format_text(self):
         """Current audio input format (str) (read-only)."""
         return self._get_multiprop("Z1AIF", mode="text")
 
@@ -1195,7 +1154,7 @@ class AVR(asyncio.Protocol):
     #
 
     @property
-    def input_list(self) -> list[str]:
+    def input_list(self):
         """List of all enabled inputs."""
         return list(self._input_numbers.keys())
 
@@ -1204,14 +1163,14 @@ class AVR(asyncio.Protocol):
     #
 
     @property
-    def dump_rawdata(self) -> str:
+    def dump_rawdata(self):
         """Return contents of transport object for debugging forensics."""
         if hasattr(self, "transport"):
             attrs = vars(self.transport)
             return ", ".join("%s: %s" % item for item in attrs.items())
 
     @property
-    def test_string(self) -> str:
+    def test_string(self):
         """I really do."""
         return "I like cows"
 
@@ -1223,7 +1182,7 @@ class Zone:
         self._zone = zone
         self._avr = avr
         self.need_refresh = True
-        self.values: dict[str, str] = {}
+        self.values = {}
 
     def command(self, command: str) -> None:
         self._avr.command(f"Z{self._zone}{command}")
@@ -1231,7 +1190,7 @@ class Zone:
     def query(self, command: str) -> None:
         self._avr.query(f"Z{self._zone}{command}")
 
-    def _get_integer(self, key: str, default: int = 0) -> int:
+    def _get_integer(self, key, default: int = 0) -> int:
         if key not in self.values:
             return default
         try:
@@ -1239,7 +1198,7 @@ class Zone:
         except ValueError:
             return 0
 
-    def _get_boolean(self, key: str) -> bool:
+    def _get_boolean(self, key) -> bool:
         if key not in self.values:
             return False
         try:
@@ -1249,21 +1208,21 @@ class Zone:
         except AttributeError:
             return False
 
-    def _set_boolean(self, key: str, value: bool) -> None:
+    def _set_boolean(self, key: str, value: bool):
         if value is True:
             self.command(key + "1")
         else:
             self.command(key + "0")
 
-    def get_current_input_value(self, command: str) -> str | None:
-        if self.input_number > 0 and self._avr._model_series == MODEL_X40:
+    def get_current_input_value(self, command: str) -> str:
+        if self.input_number > 0 and self._avr._model is not None and self._avr._model.model_series == "x40":
             return self._avr.values.get(f"IS{self.input_number}{command}")
         return None
 
     @property
     def support_attenuation(self) -> bool:
         """Return true if the zone support sound mode and sound mode list."""
-        return self._avr._model_series == MODEL_X20
+        return self._avr._model is None or self._avr._model.model_series == "x20"
 
     #
     # Volume and Attenuation handlers.  The Anthem tracks volume internally as
@@ -1293,7 +1252,7 @@ class Zone:
         except ValueError:
             return 0
 
-    def volume_to_attenuation(self, value: int) -> int:
+    def volume_to_attenuation(self, value: int):
         """Convert a volume value to a native attenuation value.
 
         Takes a volume value and turns it into an attenuation value suitable
@@ -1318,7 +1277,7 @@ class Zone:
         return self._get_boolean("POW")
 
     @power.setter
-    def power(self, value: bool) -> None:
+    def power(self, value: bool):
         self._set_boolean("POW", value)
         self.query("POW")
 
@@ -1334,19 +1293,19 @@ class Zone:
         >>> volvalue = volume
         >>> volume = 20
         """
-        if self._avr._model_series == MODEL_X40 and "PVOL" in self.values:
+        if self._avr._model is not None and self._avr._model.model_series == "x40" and "PVOL" in self.values:
             return self._get_integer("PVOL")
-        elif self._avr._model_series == MODEL_MDX:
+        elif self._avr._model is not None and self._avr._model.model_series == "mdx":
             return self._get_integer("VOL")
         else:
             return self.attenuation_to_volume(self.attenuation)
 
     @volume.setter
-    def volume(self, value: int) -> None:
+    def volume(self, value: int):
         if 0 <= value <= 100:
-            if self._avr._model_series == MODEL_X40:
+            if self._avr._model is not None and self._avr._model.model_series == "x40":
                 self.command(f"PVOL{value}")
-            elif self._avr._model_series == MODEL_MDX:
+            elif self._avr._model is not None and self._avr._model.model_series == "mdx":
                 self.command(f"VOL{value}")
             else:
                 self.attenuation = self.volume_to_attenuation(value)
@@ -1367,7 +1326,7 @@ class Zone:
         return volume_per
 
     @volume_as_percentage.setter
-    def volume_as_percentage(self, value: float) -> None:
+    def volume_as_percentage(self, value: float):
         if 0 <= value <= 1:
             value = round(value * 100)
             self.volume = value
@@ -1387,7 +1346,7 @@ class Zone:
         return self._get_integer("VOL", -90)
 
     @attenuation.setter
-    def attenuation(self, value: int) -> None:
+    def attenuation(self, value: int):
         if -90 <= value <= 0:
             self._avr.log.debug("Setting attenuation to %s", str(value))
             self.command(f"VOL{value}")
@@ -1398,7 +1357,7 @@ class Zone:
         return self._get_boolean("MUT")
 
     @mute.setter
-    def mute(self, value: bool) -> None:
+    def mute(self, value: bool):
         self._set_boolean("MUT", value)
         # Query mute because the AVR doesn't always return back the state
         # (eg: after power on without changing the volume first)
@@ -1410,7 +1369,7 @@ class Zone:
         return self._get_integer("INP")
 
     @input_number.setter
-    def input_number(self, number: int) -> None:
+    def input_number(self, number: int):
         if 1 <= number <= 99:
             self._avr.log.debug(f"Switching input to {number} for zone {self._zone}")
             self.command(f"INP{number}")
@@ -1423,7 +1382,7 @@ class Zone:
         return self._avr._input_names.get(self.input_number, "Unknown")
 
     @input_name.setter
-    def input_name(self, value: str) -> None:
+    def input_name(self, value: str):
         number = self._avr._input_numbers.get(value, 0)
         if number > 0:
             self.input_number = number
@@ -1431,7 +1390,7 @@ class Zone:
     @property
     def input_format(self) -> str:
         """Input video and audio format for the current zone if available (usually only zone 1)."""
-        if self._zone == 1 and self._avr._model_series != MODEL_MDX:
+        if self._zone == 1 and (self._avr._model is None or self._avr._model.model_series != "mdx"):
             return (
                 f"{self._avr.video_input_resolution_text} {self._avr.audio_input_name}"
             )
