@@ -667,6 +667,9 @@ class AVR(asyncio.Protocol):
             self._alm_number = self._model.alm_number_mapping
             # x20-specific initialization
             self.command("ECH1")
+        
+        # Initialize zones for the model
+        self.set_zones(model)
 
     def set_zones(self, model: str):
         """Set zones for the appropriate objects."""
@@ -1044,8 +1047,11 @@ class AVR(asyncio.Protocol):
     @property
     def audio_listening_mode_list(self):
         """List of available listening mode."""
-        if any(m in self.model for m in ALM_RESTRICTED_MODEL):
-            return [LOOKUP["Z1ALM"][s] for s in ALM_RESTRICTED]
+        if self._model is not None:
+            restricted_models = self._model.alm_restricted_models
+            if any(m in self.model for m in restricted_models):
+                restricted = self._model.alm_restricted
+                return [LOOKUP["Z1ALM"][s] for s in restricted]
         return list(self._alm_number.keys())
 
     @property
