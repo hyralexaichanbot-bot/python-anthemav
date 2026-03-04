@@ -1,5 +1,6 @@
 import pytest
-from anthemav.protocol import LOOKUP, MODEL_X20, ALM_NUMBER_x20
+from anthemav.protocol import LOOKUP
+from anthemav.models.x20 import ALM_NUMBER_X20
 from anthemav import AVR
 from unittest.mock import call, patch
 
@@ -29,7 +30,7 @@ class TestProtocol:
 
     def test_all_alm_matchnumber(self):
         for alm in list(LOOKUP["Z1ALM"].values())[1:]:
-            assert alm in ALM_NUMBER_x20
+            assert alm in ALM_NUMBER_X20
 
     async def test_power_on_force_refresh(self):
         avr = AVR()
@@ -87,9 +88,9 @@ class TestProtocol:
         avr = AVR()
         avr._device_power = True
         with patch.object(avr, "command") as mock:
-            avr._model_series = MODEL_X20
+            avr.set_model_command("MRX 520")
             avr.arc = True
-            mock.assert_called_once_with("Z1ARC1")
+            mock.assert_any_call("Z1ARC1")
 
     async def test_set_arc_x40(self):
         avr = AVR()
@@ -187,7 +188,7 @@ class TestProtocol:
         avr = AVR()
         avr._device_power = True
         with patch.object(avr, "command") as mock:
-            avr._model_series = "x20"
+            avr.set_model_command("MRX 520")
             assert avr.zones[1].volume_as_percentage == 0
             avr.zones[1].volume_as_percentage = 0.53
             mock.assert_any_call("Z1VOL-42")
@@ -196,7 +197,7 @@ class TestProtocol:
         avr = AVR()
         avr._device_power = True
         with patch.object(avr, "command") as mock:
-            avr._model_series = "x20"
+            avr.set_model_command("MRX 520")
             assert avr.volume_as_percentage == 0
             avr.volume_as_percentage = 0.53
             mock.assert_any_call("Z1VOL-42")
@@ -205,7 +206,7 @@ class TestProtocol:
         avr = AVR()
         avr._device_power = True
         with patch.object(avr, "command") as mock:
-            avr._model_series = "x40"
+            avr.set_model_command("MRX 540")
             avr.volume_as_percentage = 0.53
             mock.assert_any_call("Z1PVOL53")
 
@@ -213,7 +214,7 @@ class TestProtocol:
         avr = AVR()
         avr._device_power = True
         with patch.object(avr, "command") as mock:
-            avr._model_series = "mdx"
+            avr.set_model_command("MDX-8")
             avr.volume_as_percentage = 0.53
             mock.assert_any_call("Z1VOL53")
 
@@ -257,7 +258,7 @@ class TestProtocol:
 
     async def test_zone_input_format_mrx(self):
         avr = AVR()
-        avr._model_series = "x40"
+        avr.set_model_command("MRX 540")
         avr._device_power = True
         await avr._parse_message("Z1VIR6")
         await avr._parse_message("Z1AINDTS Master Audio")
@@ -265,17 +266,17 @@ class TestProtocol:
 
     def test_zone_input_format_mdx(self):
         avr = AVR()
-        avr._model_series = "mdx"
+        avr.set_model_command("MDX-8")
         avr._device_power = True
         assert avr.zones[1].input_format == ""
 
     async def test_input_format_mrx_zone2(self):
         avr = AVR()
-        avr._model_series = "x40"
+        avr.set_model_command("MRX 540")
         avr._device_power = True
-        avr.set_zones("MRX 540")
         await avr._parse_message("Z1VIR6")
         await avr._parse_message("Z1AINDTS Master Audio")
+        # Zone 2 exists but input_format is only for zone 1
         assert avr.zones[2].input_format == ""
 
     @pytest.mark.parametrize(

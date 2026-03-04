@@ -1039,8 +1039,11 @@ class AVR(asyncio.Protocol):
     @property
     def audio_listening_mode_list(self):
         """List of available listening mode."""
-        if any(m in self.model for m in ALM_RESTRICTED_MODEL):
-            return [LOOKUP["Z1ALM"][s] for s in ALM_RESTRICTED]
+        if self._model is not None:
+            restricted_models = self._model.alm_restricted_models
+            if any(m in self.model for m in restricted_models):
+                restricted = self._model.alm_restricted
+                return [LOOKUP["Z1ALM"][s] for s in restricted]
         return list(self._alm_number.keys())
 
     @property
@@ -1385,7 +1388,7 @@ class Zone:
     @property
     def input_format(self) -> str:
         """Input video and audio format for the current zone if available (usually only zone 1)."""
-        if self._zone == 1 and self._avr._model is None or self._avr._model.model_series != "mdx":
+        if self._zone == 1 and (self._avr._model is None or self._avr._model.model_series != "mdx"):
             return (
                 f"{self._avr.video_input_resolution_text} {self._avr.audio_input_name}"
             )
