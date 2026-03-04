@@ -1,10 +1,11 @@
 """Module to maintain AVR state information and network interface."""
 import asyncio
 import logging
-from typing import Awaitable, Callable, Dict
+from typing import Awaitable, Callable, Dict, Optional
 
 from anthemav.device_error import DeviceError
 from anthemav.parser import parse_message
+from anthemav.models import BaseModel, detect_model
 
 __all__ = ["AVR"]
 
@@ -15,42 +16,7 @@ ATTR_CORE = ["IDM"]
 # This is used to force refresh the power state of the device if POW command isn't sent
 ATTR_POWERED_ON = ["Z1ALM", "Z1AIC", "Z1VIR"]
 
-# Audio Listening mode
-ALM_NUMBER_x20 = {
-    "None": 0,
-    "AnthemLogic Cinema": 1,
-    "AnthemLogic Music": 2,
-    "PLII Movie": 3,
-    "PLII Music": 4,
-    "Neo Cinema": 5,
-    "Neo Music": 6,
-    "All Channel": 7,
-    "All Channel Mono": 8,
-    "Mono": 9,
-    "Mono-Academy": 10,
-    "Mono (L)": 11,
-    "Mono (R)": 12,
-    "High Blend": 13,
-    "Dolby Surround": 14,
-}
-
-ALM_NUMBER_x40 = {
-    "None": 0,
-    "AnthemLogic Cinema": 1,
-    "AnthemLogic Music": 2,
-    "Dolby Surround": 3,
-    "DTS neural:X": 4,
-    "DTS Virtual:X": 5,
-    "All Channel Stereo": 6,
-    "Mono": 7,
-    "All Channel Mono": 8,
-}
-
-# Some models (eg:MRX 520) provide a limited list of listening mode
-ALM_RESTRICTED = ["00", "01", "02", "03", "04", "05", "06", "07"]
-
-ALM_RESTRICTED_MODEL = ["MRX 520"]
-
+# Global lookup tables - populated from model when detected
 LOOKUP: Dict[str, Dict[str, str]] = {}
 ZONELOOKUP: Dict[str, Dict[str, str]] = {}
 
@@ -141,9 +107,7 @@ LOOKUP["Z1DYN"] = {
     "2": "Late Night",
 }
 LOOKUP["Z1DIA"] = {"description": "Dolby digital dialog normalization (dB)"}
-
-# Model specific lookupp
-# MRX 520, 720, 1120
+# Model-specific lookups will be populated from model object when detected
 LOOKUP["IDN"] = {"description": "MAC address"}
 LOOKUP["ECH"] = {"description": "Tx status", "0": "Off", "1": "On"}
 LOOKUP["SIP"] = {"description": "Standby IP control", "0": "Off", "1": "On"}
@@ -155,8 +119,6 @@ LOOKUP["FPB"] = {
     "2": "Medium",
     "3": "High",
 }
-
-# MRX 540, 740, 1140
 LOOKUP["WMAC"] = {"description": "Wi-Fi MAC address"}
 LOOKUP["EMAC"] = {"description": "Ethernet MAC address"}
 LOOKUP["GCFPB"] = {"description": "Front Panel Brightness"}
@@ -166,34 +128,10 @@ LOOKUP["GCTXS"] = {
     "1": "IP On",
     "2": "IP and RS232 on",
 }
-
-# MDX
 LOOKUP["MAC"] = {"description": "MAC address"}
-
-COMMANDS_X20 = ["IDN", "ECH", "SIP", "Z1ARC", "FPB"]
-COMMANDS_X40 = ["PVOL", "WMAC", "EMAC", "IS1ARC", "GCFPB", "GCTXS"]
-COMMANDS_MDX_IGNORE = [
-    "IDR",
-    "ICN",
-    "Z1AIC",
-    "Z1AIN",
-    "Z1AIR",
-    "Z1ALM",
-    "Z1BRT",
-    "Z1DIA",
-    "Z1DYN",
-    "Z1IRH",
-    "Z1IRV",
-    "Z1VIR",
-]
-COMMANDS_MDX = ["MAC"]
 
 EMPTY_MAC = "00:00:00:00:00:00"
 UNKNOWN_MODEL = "Unknown Model"
-
-MODEL_X40 = "x40"
-MODEL_X20 = "x20"
-MODEL_MDX = "mdx"
 
 
 # pylint: disable=too-many-instance-attributes, too-many-public-methods
@@ -237,10 +175,10 @@ class AVR(asyncio.Protocol):
         self.transport: asyncio.Transport = None
         self._ignored_commands = []
         self._force_refresh = False
-        self._model_series = ""
+        self._model: Optional[BaseModel] = None
         self._last_command = ""
         self._deviceinfo_received = asyncio.Event()
-        self._alm_number = {"None": 0}
+        self._alm_number: Dict[str, int] = {"None": 0}
         self._available_input_numbers = []
         self.zones: Dict[int, Zone] = {1: Zone(self, 1)}
         self.values: Dict[str, str] = {}
@@ -262,7 +200,7 @@ class AVR(asyncio.Protocol):
 
     def _set_device_initialised(self):
         """Indicate if the model and mac address have been received."""
-        if self._model_series and self.macaddress != EMPTY_MAC:
+        if self._model is not None and self.macaddress != EMPTY_MAC:
             self._deviceinfo_received.set()
 
     async def refresh_core(self):
@@ -312,7 +250,7 @@ class AVR(asyncio.Protocol):
         self.log.debug("refresh_all")
         # refresh main attribues
         await self.query_commands(LOOKUP)
-        if self._model_series == MODEL_MDX:
+        if self._model is not None and self._model.model_series == "mdx":
             # MDX receivers don't returns the list of available input numbers and have a fixed list
             self._populate_inputs(12)
 
@@ -420,7 +358,7 @@ class AVR(asyncio.Protocol):
         """
         total = total + 1
         for input_number in range(1, total):
-            if self._model_series == MODEL_X40:
+            if self._model is not None and self._model.model_series == "x40":
                 self.query(f"IS{input_number}IN")
                 self.query(f"IS{input_number}ARC")
             else:
@@ -635,9 +573,11 @@ class AVR(asyncio.Protocol):
 
     async def refresh_input(self):
         """Refresh specific input commands."""
-        if self._model_series == MODEL_X20:
+        if self._model is None:
+            return
+        if self._model.model_series == "x20":
             self.query("Z1ARC")
-        elif self._model_series == MODEL_X40:
+        elif self._model.model_series == "x40":
             self.query(f"IS{self.zones[1].input_number}ARC")
 
     async def force_refresh_power(self, command):
@@ -679,38 +619,65 @@ class AVR(asyncio.Protocol):
 
     def set_model_command(self, model: str):
         """Add the commands to the model."""
-        if "40" in model or "70" in model or "90" in model:
+        # Detect model using registry
+        self._model = detect_model(model)
+        
+        if self._model is None:
+            self.log.warning("Unknown model: %s, defaulting to x20", model)
+            self._model = detect_model("MRX 520")  # Default to x20
+        
+        self.log.debug("Detected model series: %s", self._model.model_series)
+        
+        # Set ignored commands based on model
+        if self._model.model_series == "x40":
             self.log.debug("Set Command to Model x40")
-            self._ignored_commands = COMMANDS_X20 + COMMANDS_MDX
-            self._model_series = MODEL_X40
-            self.query("GCTXS")
-            self.query("EMAC")
-            self.query("WMAC")
-            self._alm_number = ALM_NUMBER_x40
-        elif "MDX" in model or "MDA" in model:
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add MDX commands to ignore
+            mdx_model = detect_model("MDX-8")
+            if mdx_model:
+                self._ignored_commands.extend(mdx_model.commands_to_ignore)
+            # Query x40-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
+        elif self._model.model_series == "mdx":
             self.log.debug("Set Command to Model MDX")
-            self._ignored_commands = COMMANDS_X20 + COMMANDS_X40 + COMMANDS_MDX_IGNORE
-            self._model_series = MODEL_MDX
-            self.query("MAC")
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add x20 and x40 commands to ignore
+            x20_model = detect_model("MRX 520")
+            x40_model = detect_model("MRX 540")
+            if x20_model:
+                self._ignored_commands.extend(x20_model.commands_to_ignore)
+            if x40_model:
+                self._ignored_commands.extend(x40_model.commands_to_ignore)
+            # Query MDX-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
         else:
             self.log.debug("Set Command to Model x20")
-            self._ignored_commands = COMMANDS_X40 + COMMANDS_MDX
-            self._model_series = MODEL_X20
-            self._alm_number = ALM_NUMBER_x20
+            self._ignored_commands = self._model.commands_to_ignore.copy()
+            # Add MDX commands to ignore
+            mdx_model = detect_model("MDX-8")
+            if mdx_model:
+                self._ignored_commands.extend(mdx_model.commands_to_ignore)
+            # Query x20-specific commands
+            for cmd in self._model.commands_to_query:
+                self.query(cmd)
+            self._alm_number = self._model.alm_number_mapping
+            # x20-specific initialization
             self.command("ECH1")
-            self.query("IDN")
 
     def set_zones(self, model: str):
         """Set zones for the appropriate objects."""
-        number_of_zones: int = 0
-        if self._model_series == MODEL_MDX and "16" in model:
-            number_of_zones = 8
-        elif self._model_series == MODEL_MDX and "8" in model:
-            number_of_zones = 4
-            # MDX 16 input number range is 1 to 12, but MDX 8 only have 1 to 4 and 9
-            self._available_input_numbers = [1, 2, 3, 4, 9]
-        else:
+        if self._model is None:
+            self.log.warning("Model not set, defaulting to 2 zones")
             number_of_zones = 2
+        else:
+            number_of_zones = self._model.get_zone_count(model)
+            # Get available input numbers for MDX-8
+            if self._model.model_series == "mdx" and "8" in model:
+                self._available_input_numbers = self._model.get_available_input_numbers(model)
 
         self.log.debug(f"Initialize {number_of_zones} zones")
         for zone in range(1, number_of_zones + 1):
@@ -768,17 +735,17 @@ class AVR(asyncio.Protocol):
     @property
     def support_audio_listening_mode(self) -> bool:
         """Return true if the zone support audio listening mode."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
     def support_profile(self) -> bool:
         """Return true if the zone support sound mode and sound mode list."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
     def support_arc(self) -> bool:
         """Return true if the zone support Anthem room correction."""
-        return self._model_series != MODEL_MDX
+        return self._model is None or self._model.model_series != "mdx"
 
     @property
     def attenuation(self):
@@ -920,19 +887,23 @@ class AVR(asyncio.Protocol):
     @property
     def arc(self) -> bool:
         """Current ARC (Anthem Room Correction) on or off (read/write)."""
-        if self._model_series == MODEL_X40:
+        if self._model is None:
+            return None
+        if self._model.model_series == "x40":
             return self._convert_to_boolean(
                 self.zones[1].get_current_input_value("ARC")
             )
-        elif self._model_series == MODEL_X20:
+        elif self._model.model_series == "x20":
             return self._get_boolean("Z1ARC")
         return None
 
     @arc.setter
     def arc(self, value):
-        if self._model_series == MODEL_X40:
+        if self._model is None:
+            return
+        if self._model.model_series == "x40":
             self._set_boolean(f"IS{self.zones[1].input_number}ARC", value)
-        elif self._model_series == MODEL_X20:
+        elif self._model.model_series == "x20":
             self._set_boolean("Z1ARC", value)
 
     #
@@ -1244,14 +1215,14 @@ class Zone:
             self.command(key + "0")
 
     def get_current_input_value(self, command: str) -> str:
-        if self.input_number > 0 and self._avr._model_series == MODEL_X40:
+        if self.input_number > 0 and self._avr._model is not None and self._avr._model.model_series == "x40":
             return self._avr.values.get(f"IS{self.input_number}{command}")
         return None
 
     @property
     def support_attenuation(self) -> bool:
         """Return true if the zone support sound mode and sound mode list."""
-        return self._avr._model_series == MODEL_X20
+        return self._avr._model is None or self._avr._model.model_series == "x20"
 
     #
     # Volume and Attenuation handlers.  The Anthem tracks volume internally as
@@ -1322,9 +1293,9 @@ class Zone:
         >>> volvalue = volume
         >>> volume = 20
         """
-        if self._avr._model_series == MODEL_X40 and "PVOL" in self.values:
+        if self._avr._model is not None and self._avr._model.model_series == "x40" and "PVOL" in self.values:
             return self._get_integer("PVOL")
-        elif self._avr._model_series == MODEL_MDX:
+        elif self._avr._model is not None and self._avr._model.model_series == "mdx":
             return self._get_integer("VOL")
         else:
             return self.attenuation_to_volume(self.attenuation)
@@ -1332,9 +1303,9 @@ class Zone:
     @volume.setter
     def volume(self, value: int):
         if 0 <= value <= 100:
-            if self._avr._model_series == MODEL_X40:
+            if self._avr._model is not None and self._avr._model.model_series == "x40":
                 self.command(f"PVOL{value}")
-            elif self._avr._model_series == MODEL_MDX:
+            elif self._avr._model is not None and self._avr._model.model_series == "mdx":
                 self.command(f"VOL{value}")
             else:
                 self.attenuation = self.volume_to_attenuation(value)
@@ -1419,7 +1390,7 @@ class Zone:
     @property
     def input_format(self) -> str:
         """Input video and audio format for the current zone if available (usually only zone 1)."""
-        if self._zone == 1 and self._avr._model_series != MODEL_MDX:
+        if self._zone == 1 and (self._avr._model is None or self._avr._model.model_series != "mdx"):
             return (
                 f"{self._avr.video_input_resolution_text} {self._avr.audio_input_name}"
             )
